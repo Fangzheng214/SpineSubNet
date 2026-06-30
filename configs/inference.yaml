@@ -1,0 +1,14 @@
+# Inference Configuration - Grayscale Baseline
+
+model:
+  checkpoint: "experiments/baseline_grayscale/weights/best_metric.pth"
+
+data:
+  spatial_size: [160, 160, 160]
+  target_spacing: [1.0, 1.0, 1.0]
+  use_spacing: true
+
+inference:
+  resample_to_original: true
+  input_dir: "data/subregion/grayscale"
+  output_dir: "inference_output"
