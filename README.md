@@ -1,34 +1,54 @@
 # SpineSubNet
 
-Official PyTorch / [MONAI](https://monai.io/) implementation for **3D lumbar substructure segmentation** from grayscale CT volumes.
+Official PyTorch / [MONAI](https://monai.io/) implementation for **3D lumbar vertebra substructure segmentation** from grayscale CT volumes.
 
-This repository provides a modular training and inference pipeline for vertebra subregion segmentation, including dataset preparation, baseline 3D U-Net training, batch inference with native-geometry resampling, quantitative evaluation, and post-processing utilities.
+This repository provides an end-to-end pipeline for lumbar subregion segmentation: data preparation, 3D U-Net training, batch inference with optional resampling to native geometry, quantitative evaluation, post-processing, and inter-rater annotation consistency analysis.
+
+## Overview
+
+| Item | Description |
+|------|-------------|
+| **Task** | Multi-class 3D segmentation of lumbar vertebral substructures |
+| **Input** | Single-channel grayscale CT (`.nii` / `.nii.gz`) |
+| **Output** | 8-class label map (background + 7 subregions) |
+| **Model** | 3D U-Net ([MONAI](https://docs.monai.io/en/stable/networks.html#unet)) |
+| **Loss** | Cross-Entropy + Dice |
+| **Metrics** | Dice (DSC), Hausdorff Distance 95% (HD95) |
+
+Each training sample corresponds to one cropped lumbar level (e.g. `subject_L3.nii.gz`). Subject-level splitting ensures all levels from the same patient stay in the same train / validation / test split.
 
 ## Features
 
-- **Training** — 1-channel 3D U-Net on grayscale CT input (`configs/baseline_grayscale.yaml`)
-- **Data** — NIfTI (`.nii` / `.nii.gz`), Decathlon-style `dataset.json`, resampling and augmentations via MONAI
-- **Inference** — Batch inference on a directory of NIfTI volumes with resampling back to native geometry
-- **Evaluation** — Dice and HD95 on a held-out test set
-- **Post-processing** — Parallel mask alignment against reference geometry (`tools/process.py`)
+- **Training** — Baseline 3D U-Net on grayscale CT with AdamW, WarmupCosine LR schedule, and TensorBoard logging
+- **Data pipeline** — MONAI transforms: RAS orientation, isotropic resampling, HU windowing, spatial padding, and random augmentations
+- **Dataset tools** — Generate Decathlon-style `dataset.json`, crop lumbar regions from full-spine CT, and summarize CT shapes before/after resampling
+- **Inference** — Batch prediction on a NIfTI directory with optional resampling back to original spacing and geometry
+- **Evaluation** — Per-class and overall Dice / HD95 on a held-out test set
+- **Post-processing** — Parallel mask alignment: connected-component denoising, mask-constrained clipping, and nearest-label filling
+- **Annotation consistency** — Compare rater annotations against baseline labels (Dice, HD95, summary tables)
+- **Pretrained weights** — Checkpoints trained on Colon, VerSe, LumASe, and a combined Total dataset (see [Pretrained Models](#pretrained-models))
 
 ## Repository Layout
 
 ```
 SpineSubNet/
-├── configs/          # YAML experiment files
-├── data/             # Data transforms and loaders
-├── losses/           # Segmentation losses
-├── models/           # Network definitions
-├── scripts/          # Bash helpers
-├── tools/            # Inference, evaluation, post-processing
-├── trainers/         # Training loops
-├── utils/            # Logging, config, experiment utilities
-├── train.py          # Main training entry point
-└── requirements.txt  # Python dependencies
+├── configs/              # YAML configs for training and inference
+├── consistency/          # Sample data and inter-rater consistency evaluation
+├── data/                 # Transforms and DataLoader utilities
+├── experiments/          # Pretrained model checkpoints
+├── losses/               # Segmentation loss functions
+├── models/               # U-Net factory and network definitions
+├── scripts/              # Shell helpers (train / inference)
+├── tools/                # CLI utilities (dataset, inference, evaluation, etc.)
+├── trainers/             # Training loops
+├── utils/                # Config parsing, logging, experiment setup
+├── train.py              # Main training entry point
+└── requirements.txt      # Python dependencies
 ```
 
 ## Installation
+
+**Requirements:** Python 3.10+, CUDA-capable GPU recommended for training and inference.
 
 ```bash
 git clone https://github.com/<your-username>/SpineSubNet.git
@@ -42,29 +62,244 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+> Large checkpoints and sample NIfTI files are tracked with Git LFS. Run `git lfs pull` after cloning if weights or data files appear as pointer stubs.
+
 ## Dataset Format
 
-Under one root directory (e.g. `data/subregion/`):
+Organize data under one root directory (e.g. `data/subregion/`):
 
-- `grayscale/` — intensity volumes (`.nii.gz`)
-- `label/` — same filenames, multi-class subregion labels
-
-Generate a `dataset.json` with train / validation / test splits:
-
-```bash
-python tools/create_dataset.py --data_dir /path/to/your_dataset --output dataset.json
+```
+data/subregion/
+├── binary/       # Binary foreground masks (same filenames)
+├── grayscale/    # Grayscale CT volumes
+├── label/        # Multi-class subregion labels (8 classes: 0–7)
+└── dataset.json  # Generated by tools/create_dataset.py
 ```
 
+- Filenames should include a lumbar level suffix, e.g. `patient001_L3.nii.gz`
+- `binary/`, `grayscale/`, and `label/` must contain matching filenames for each sample
+- Training reads **grayscale** and **label** only; `binary/` is required for dataset JSON generation
+
+Use [`tools/create_dataset.py`](#toolscreatedatasetpy) to generate `dataset.json`. See [Tools](#tools) for all CLI utilities.
+
+## Tools
+
+Command-line utilities under `tools/` cover the full workflow from data preparation to post-processing.
+
+| Script | Purpose |
+|--------|---------|
+| [`create_dataset.py`](#toolscreatedatasetpy) | Build MONAI-style `dataset.json` with subject-level splits |
+| [`crop_lumbar_ct.py`](#toolscrop_lumbar_ctpy) | Crop per-vertebra CT volumes from full-spine scans |
+| [`stat_ct_size.py`](#toolsstat_ct_sizepy) | Summarize CT shapes/spacings before and after resampling |
+| [`inference.py`](#toolsinferencepy) | Batch 3D U-Net inference on NIfTI volumes |
+| [`evaluate_model.py`](#toolsevaluate_modelpy) | Evaluate a trained model on the test split (Dice / HD95) |
+| [`process.py`](#toolsprocesspy) | Post-process and align predictions to reference mask geometry |
+
+---
+
+### `tools/create_dataset.py`
+
+Scan `binary/`, `grayscale/`, and `label/` under a data root, keep only samples with all three files present, and write a Decathlon-style `dataset.json` with train / validation / test splits.
+
+**Split strategy:** samples are grouped by subject prefix (filename before `_L{level}`). All lumbar levels from the same subject stay in the same split. Default ratios: 70% / 10% / 20%.
+
+```bash
+python tools/create_dataset.py \
+  --data_dir /path/to/your_dataset \
+  --output dataset.json
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--data_dir` | *(required)* | Root directory containing `binary/`, `grayscale/`, `label/` |
+| `--output` | `dataset.json` | Output JSON filename (saved under `data_dir`) |
+| `--train_ratio` | `0.7` | Training set ratio |
+| `--val_ratio` | `0.1` | Validation set ratio |
+| `--test_ratio` | `0.2` | Test set ratio |
+| `--seed` | `42` | Random seed for reproducible splits |
+
+**Output:** `dataset.json` with `training`, `validation`, and `testing` entries, each pointing to relative paths under `binary/`, `grayscale/`, and `label/`.
+
+---
+
+### `tools/crop_lumbar_ct.py`
+
+Crop lumbar vertebra regions from full-spine CT using an existing vertebra segmentation mask. For each CT/mask pair, one cropped volume is saved per lumbar level based on the mask bounding box in voxel space.
+
+Supports two label schemes:
+
+| `--dataset` | Lumbar levels | Label IDs |
+|-------------|---------------|-----------|
+| `verse` | L1–L6 | 20–25 |
+| `colon` | L1–L5 | 20–24 |
+
+```bash
+python tools/crop_lumbar_ct.py \
+  --ct_dir /path/to/rawdata \
+  --mask_dir /path/to/derivatives \
+  --output_dir /path/to/output \
+  --dataset verse \
+  --margin 0
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--ct_dir` | *(required)* | Directory of full-spine CT NIfTI files |
+| `--mask_dir` | *(required)* | Directory of vertebra segmentation masks |
+| `--output_dir` | *(required)* | Output directory for cropped volumes |
+| `--dataset` | `verse` | Label scheme: `verse` or `colon` |
+| `--margin` | `0` | Extra voxels around each vertebra bounding box |
+| `--preserve_structure` | off | Keep `sub-XXX/` subfolders in output |
+| `--verbose` | off | Enable debug logging |
+
+Output filenames follow `{subject}_{level}.nii.gz` (e.g. `sub-verse816_ct_L1.nii.gz`).
+
+---
+
+### `tools/stat_ct_size.py`
+
+Summarize CT NIfTI voxel shapes and spacings **before** and **after** the training resampling step (`Spacingd`). Post-spacing size is estimated with the same formula used in the training pipeline:
+
+```
+new_size[i] = round(original_size[i] * original_spacing[i] / target_spacing[i])
+```
+
+Useful for checking whether the default 160³ padding size is appropriate for your data.
+
+```bash
+# Scan a directory of CT volumes
+python tools/stat_ct_size.py --input_dir /path/to/grayscale
+
+# Or read paths from dataset.json
+python tools/stat_ct_size.py \
+  --json /path/to/dataset.json \
+  --data_root /path/to/data \
+  --split training
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input_dir` | — | Directory of CT NIfTI files *(mutually exclusive with `--json`)* |
+| `--json` | — | Path to `dataset.json` *(requires `--data_root`)* |
+| `--data_root` | `""` | Root for relative paths in `dataset.json` |
+| `--split` | `training` | Split to scan: `training`, `validation`, or `testing` |
+| `--key` | `grayscale` | Image key in JSON entries |
+| `--target_spacing` | `1.0 1.0 1.0` | Target spacing (mm) for size estimation |
+| `--recursive` | off | Recursively scan subdirectories |
+
+**Output:** per-axis min/max/mean for original shape, post-spacing shape, original spacing, and voxel-count change ratio (printed to stdout).
+
+---
+
+### `tools/inference.py`
+
+Run batch inference with the grayscale 3D U-Net. Applies the same preprocessing as validation (RAS, spacing, HU windowing, padding), loads weights from a checkpoint, and saves `*_seg.nii.gz` predictions.
+
+Configuration is read from a YAML file (default: `configs/inference.yaml`).
+
+```bash
+python tools/inference.py --config configs/inference.yaml
+```
+
+| Argument | Description |
+|----------|-------------|
+| `--config` | Path to inference YAML config *(required)* |
+
+**Key config fields** (`configs/inference.yaml`):
+
+| Field | Description |
+|-------|-------------|
+| `model.checkpoint` | Path to `.pth` weights |
+| `data.spatial_size` | Input patch size, e.g. `[160, 160, 160]` |
+| `data.target_spacing` | Resampling target, e.g. `[1.0, 1.0, 1.0]` |
+| `inference.input_dir` | Directory of input `.nii.gz` volumes |
+| `inference.output_dir` | Directory for `*_seg.nii.gz` outputs |
+| `inference.resample_to_original` | Resample predictions back to native geometry |
+
+---
+
+### `tools/evaluate_model.py`
+
+Evaluate a trained model on the **testing** split in `dataset.json`. Reports overall and per-class Dice (DSC) and Hausdorff Distance 95% (HD95).
+
+```bash
+python tools/evaluate_model.py \
+  --model_path experiments/baseline_grayscale/weights/best_metric.pth \
+  --config configs/baseline_grayscale.yaml \
+  --test_json /path/to/dataset.json \
+  --output_dir evaluation_results/baseline
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model_path` | *(required)* | Path to trained weights (`.pth`) |
+| `--config` | *(required)* | Training YAML config (for model architecture and transforms) |
+| `--test_json` | *(required)* | `dataset.json` containing a `testing` split |
+| `--output_dir` | `evaluation_results` | Directory for logs and result files |
+| `--batch_size` | `1` | Evaluation batch size |
+| `--skip_hd95` | off | Skip HD95 computation to save GPU memory |
+
+**Output files** (under `--output_dir`):
+- `evaluation_*.log` — full run log
+- `evaluation_per_sample_*.csv` — per-sample metrics
+- `evaluation_summary_*.txt` — overall and per-class Dice / HD95 summary
+
+---
+
+### `tools/process.py`
+
+Post-process predicted segmentations and align them to reference mask geometry. Processing runs in parallel across files.
+
+**Pipeline for each segmentation/mask pair:**
+
+1. **Denoise** — remove spurious connected components per label (keeps the expected number of components per class)
+2. **Clip** — zero out prediction voxels outside the reference foreground mask
+3. **Fill** — assign nearest valid label to mask voxels where prediction is empty
+
+```bash
+python tools/process.py \
+  --seg_dir /path/to/segmentations \
+  --mask_dir /path/to/reference_masks \
+  --output_dir /path/to/aligned_output \
+  --num_workers 8
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--seg_dir` | *(required)* | Directory of predicted segmentation NIfTI files |
+| `--mask_dir` | *(required)* | Directory of reference binary/foreground masks |
+| `--output_dir` | *(required)* | Directory for aligned output segmentations |
+| `--num_workers` | `CPU count - 1` | Number of parallel worker processes |
+
+Segmentation and mask files are matched by filename (with fallback stripping of `_seg`, `_pred`, `_inference` suffixes).
+
+---
+
 ## Training
+
+Default configuration: `configs/baseline_grayscale.yaml`
+
+| Setting | Default |
+|---------|---------|
+| Spatial size | 160 × 160 × 160 |
+| Target spacing | 1.0 × 1.0 × 1.0 mm |
+| Intensity window | HU [-500, 1500] → [0, 1] |
+| Optimizer | AdamW (lr=1e-4) |
+| Max iterations | 50,000 |
+| Validation interval | Every 500 steps |
 
 ```bash
 python train.py --config configs/baseline_grayscale.yaml
 ```
 
-Optional overrides:
+Command-line overrides:
 
 ```bash
-python train.py --config configs/baseline_grayscale.yaml --data_dir /path/to/data --batch_size 1 --lr 0.0001
+python train.py \
+  --config configs/baseline_grayscale.yaml \
+  --data_dir /path/to/data \
+  --batch_size 1 \
+  --lr 0.0001
 ```
 
 Or use the shell script:
@@ -73,15 +308,35 @@ Or use the shell script:
 bash scripts/train_baseline.sh
 ```
 
+Checkpoints and TensorBoard logs are saved under `experiments/baseline_grayscale/`:
+- `weights/best_metric.pth` — best validation Dice
+- `weights/checkpoint_step_*.pth` — periodic snapshots
+
+## Pretrained Models
+
+The following checkpoints are included under `experiments/`:
+
+| Checkpoint | Description |
+|------------|-------------|
+| `Colon_best_metric.pth` | Trained on Colon dataset |
+| `Verse_best_metric.pth` | Trained on VerSe dataset |
+| `LumASe_best_metric.pth` | Trained on LumASe dataset |
+| `Total_best_metric.pth` | Trained on combined data |
+
+Point `configs/inference.yaml` to the desired checkpoint before running inference.
+
 ## Inference
 
-Edit `configs/inference.yaml` (checkpoint path, input/output directories), then:
+See [`tools/inference.py`](#toolsinferencepy) for config fields and usage.
 
 ```bash
 python tools/inference.py --config configs/inference.yaml
+# or: bash scripts/inference.sh
 ```
 
 ## Evaluation
+
+See [`tools/evaluate_model.py`](#toolsevaluate_modelpy) for full argument reference.
 
 ```bash
 python tools/evaluate_model.py \
@@ -93,7 +348,7 @@ python tools/evaluate_model.py \
 
 ## Post-processing
 
-Align predicted segmentation masks to reference mask geometry:
+See [`tools/process.py`](#toolsprocesspy) for the full post-processing pipeline and options.
 
 ```bash
 python tools/process.py \
@@ -102,9 +357,34 @@ python tools/process.py \
   --output_dir /path/to/aligned_output
 ```
 
+## Annotation Consistency Evaluation
+
+Compare multiple rater annotations against baseline reference labels. The script evaluates each rater independently against the baseline (not pairwise rater-to-rater).
+
+Expected layout:
+
+```
+consistency/
+├── label/              # Baseline reference labels
+├── anno/
+│   ├── doctor_01/      # Rater annotations ({case}_{rater}.nii.gz)
+│   ├── doctor_02/
+│   └── ...
+└── grayscale/          # Optional CT volumes
+```
+
+```bash
+python consistency/evaluate_annotation_consistency.py \
+  --baseline-label-dir consistency/label \
+  --annotations-dir consistency/anno \
+  --output-dir consistency/results
+```
+
+Outputs: per-case CSV, per-label/per-rater summary, wide-format table, JSON summary, and LaTeX tables for publication.
+
 ## Citation
 
-If this repository is useful for your work, please cite the associated paper.
+If this repository is useful for your work, please cite the associated paper:
 
 ```bibtex
 @article{topospinenet2026,
@@ -112,3 +392,7 @@ If this repository is useful for your work, please cite the associated paper.
   year    = {2026}
 }
 ```
+
+## License
+
+See repository license file for terms of use.
